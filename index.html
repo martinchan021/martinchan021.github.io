@@ -11,3 +11,415 @@
 <h1>Hello World</h1>
         </body>
         <html>
+            <!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Readable AI - 智慧語言學習系統</title>
+    
+    <!-- 外部資源載入 -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;700;900&display=swap');
+        body { 
+            font-family: 'Noto Sans TC', sans-serif; 
+            -webkit-tap-highlight-color: transparent;
+        }
+        .animate-in { animation: fadeIn 0.4s ease-out forwards; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+        /* 滾動條美化 */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; }
+        ::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 10px; }
+        ::-webkit-scrollbar-thumb:hover { background: #cbd5e1; }
+    </style>
+</head>
+<body class="bg-[#F8FAFC] text-slate-900">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        // --- Lucide Icon 組件 ---
+        const Icon = ({ name, className = "" }) => {
+            const iconRef = useRef(null);
+            useEffect(() => {
+                if (window.lucide && iconRef.current) {
+                    window.lucide.createIcons({
+                        icons: { [name]: window.lucide.icons[name] },
+                        nameAttr: 'data-lucide'
+                    });
+                }
+            }, [name]);
+            return <i data-lucide={name} className={className} ref={iconRef}></i>;
+        };
+
+        // --- 配置 ---
+        const modelName = "gemini-2.5-flash-preview-09-2025";
+        const ttsModelName = "gemini-2.5-flash-preview-tts";
+
+        const LANGUAGES = [
+            { id: 'zh-HK', name: '粵語', flag: '🇭🇰', accent: 'zh-HK', voice: 'Kore', ttsPrefix: '請用粵語讀出：' },
+            { id: 'zh-CN', name: '國語', flag: '🇨🇳', accent: 'zh-CN', voice: 'Zubenelgenubi', ttsPrefix: '請用普通話讀出：' },
+            { id: 'en', name: '英文', flag: '🇺🇸', accent: 'en-US', voice: 'Puck', ttsPrefix: 'Pronounce correctly: ' },
+            { id: 'ja', name: '日文', flag: '🇯🇵', accent: 'ja-JP', voice: 'Aoede', ttsPrefix: '日本語で読んでください：' }
+        ];
+
+        function App() {
+            const [activeTab, setActiveTab] = useState('ocr'); 
+            const [targetLang, setTargetLang] = useState('zh-HK');
+            const [file, setFile] = useState(null);
+            const [previewUrl, setPreviewUrl] = useState(null);
+            const [manualText, setManualText] = useState(''); 
+            const [isOcrProcessing, setIsOcrProcessing] = useState(false);
+            const [ocrResult, setOcrResult] = useState(null);
+            const [currentParaIndex, setCurrentParaIndex] = useState(-1);
+            const [wordInput, setWordInput] = useState(''); 
+            const [wordDefinition, setWordDefinition] = useState(null);
+            const [isRecording, setIsRecording] = useState(false);
+            const [scoreData, setScoreData] = useState(null);
+            const [evaluating, setEvaluating] = useState(false);
+            const [error, setError] = useState(null);
+            const [isSpeaking, setIsSpeaking] = useState(false);
+            const [isGeminiSpeaking, setIsGeminiSpeaking] = useState(false);
+            const [userAudioUrl, setUserAudioUrl] = useState(null);
+
+            const fileInputRef = useRef(null);
+            const synthRef = useRef(window.speechSynthesis);
+            const mediaRecorderRef = useRef(null);
+            const audioChunksRef = useRef([]);
+            const geminiAudioRef = useRef(null);
+
+            // 停止所有聲音
+            const stopAllAudio = () => {
+                if (synthRef.current) synthRef.current.cancel();
+                setIsSpeaking(false);
+                setCurrentParaIndex(-1);
+                if (geminiAudioRef.current) {
+                    geminiAudioRef.current.pause();
+                    geminiAudioRef.current = null;
+                }
+                setIsGeminiSpeaking(false);
+            };
+
+            // API 呼叫 (含重試機制)
+            const callGeminiApi = async (payload, endpoint = "generateContent", model = modelName, retries = 5) => {
+                const apiKey = ""; // 執行時自動注入
+                const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:${endpoint}?key=${apiKey}`;
+                
+                for (let i = 0; i < retries; i++) {
+                    try {
+                        const response = await fetch(url, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(payload)
+                        });
+                        if (response.ok) return await response.json();
+                        await new Promise(res => setTimeout(res, Math.pow(2, i) * 1000));
+                    } catch (err) {
+                        if (i === retries - 1) throw err;
+                    }
+                }
+            };
+
+            const pcmToWav = (base64Data, sampleRate = 24000) => {
+                const binaryString = window.atob(base64Data);
+                const bytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
+                const buffer = new ArrayBuffer(44 + bytes.length);
+                const view = new DataView(buffer);
+                const writeString = (offset, string) => {
+                    for (let i = 0; i < string.length; i++) view.setUint8(offset + i, string.charCodeAt(i));
+                };
+                writeString(0, 'RIFF');
+                view.setUint32(4, 36 + bytes.length, true);
+                writeString(8, 'WAVE');
+                writeString(12, 'fmt ');
+                view.setUint32(16, 16, true);
+                view.setUint16(20, 1, true);
+                view.setUint16(22, 1, true);
+                view.setUint32(24, sampleRate, true);
+                view.setUint32(28, sampleRate * 2, true);
+                view.setUint16(32, 2, true);
+                view.setUint16(34, 16, true);
+                writeString(36, 'data');
+                view.setUint32(40, bytes.length, true);
+                new Uint8Array(buffer, 44).set(bytes);
+                return new Blob([buffer], { type: 'audio/wav' });
+            };
+
+            const handleSpeak = (text) => {
+                if (!text) return;
+                stopAllAudio();
+                const paragraphs = text.split('\n').filter(p => p.trim());
+                const playNext = (index) => {
+                    if (index >= paragraphs.length) { setIsSpeaking(false); setCurrentParaIndex(-1); return; }
+                    setCurrentParaIndex(index);
+                    const utterance = new SpeechSynthesisUtterance(paragraphs[index]);
+                    const config = LANGUAGES.find(l => l.id === targetLang);
+                    utterance.lang = config.accent;
+                    utterance.rate = 0.95;
+                    utterance.onstart = () => setIsSpeaking(true);
+                    utterance.onend = () => { if (!synthRef.current.paused) playNext(index + 1); };
+                    synthRef.current.speak(utterance);
+                };
+                playNext(0);
+            };
+
+            const handleGeminiDemo = async (text) => {
+                if (!text || isGeminiSpeaking) return;
+                stopAllAudio();
+                setIsGeminiSpeaking(true);
+                try {
+                    const config = LANGUAGES.find(l => l.id === targetLang);
+                    const result = await callGeminiApi({
+                        contents: [{ parts: [{ text: `${config.ttsPrefix}${text}` }] }],
+                        generationConfig: {
+                            responseModalities: ["AUDIO"],
+                            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: config.voice } } }
+                        }
+                    }, "generateContent", ttsModelName);
+                    const audioData = result.candidates[0].content.parts.find(p => p.inlineData).inlineData.data;
+                    const audioUrl = URL.createObjectURL(pcmToWav(audioData));
+                    const audio = new Audio(audioUrl);
+                    geminiAudioRef.current = audio;
+                    audio.onended = () => setIsGeminiSpeaking(false);
+                    audio.play();
+                } catch (err) { 
+                    setError("AI 語音合成失敗"); 
+                    setIsGeminiSpeaking(false); 
+                }
+            };
+
+            const handleProcess = async (type) => {
+                setIsOcrProcessing(true);
+                setOcrResult(null);
+                try {
+                    const promptText = `提取文字內容。規則：100%一致。不要翻譯。回傳 JSON: {"title": "標題", "p": "全文"}`;
+                    let parts = [];
+                    if (type === 'ocr' && file) {
+                        const base64 = await new Promise(res => {
+                            const r = new FileReader(); r.readAsDataURL(file); r.onload = () => res(r.result.split(',')[1]);
+                        });
+                        parts = [{ text: promptText }, { inlineData: { mimeType: file.type, data: base64 } }];
+                    } else {
+                        parts = [{ text: `${promptText}\n\n素材：\n${manualText}` }];
+                    }
+                    const result = await callGeminiApi({ contents: [{ parts }], generationConfig: { responseMimeType: "application/json" } });
+                    const cleanJson = result.candidates[0].content.parts[0].text.replace(/```json|```/g, "").trim();
+                    setOcrResult(JSON.parse(cleanJson));
+                } catch (err) { 
+                    setError("內容提取失敗，請檢查網路連接"); 
+                } finally { 
+                    setIsOcrProcessing(false); 
+                }
+            };
+
+            const startRecording = async () => {
+                if (!wordInput.trim()) return;
+                setUserAudioUrl(null); 
+                stopAllAudio();
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    mediaRecorderRef.current = new MediaRecorder(stream);
+                    audioChunksRef.current = [];
+                    mediaRecorderRef.current.ondataavailable = e => audioChunksRef.current.push(e.data);
+                    mediaRecorderRef.current.onstop = () => {
+                        const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+                        setUserAudioUrl(URL.createObjectURL(blob));
+                        evaluatePronunciation(blob);
+                    };
+                    mediaRecorderRef.current.start();
+                    setIsRecording(true);
+                } catch (err) { 
+                    setError("無法取得麥克風權限"); 
+                }
+            };
+
+            const evaluatePronunciation = async (blob) => {
+                setEvaluating(true);
+                const reader = new FileReader();
+                reader.readAsDataURL(blob);
+                reader.onloadend = async () => {
+                    try {
+                        const base64 = reader.result.split(',')[1];
+                        const result = await callGeminiApi({
+                            contents: [{ parts: [
+                                { text: `發音分析。單字：「${wordInput}」。語言環境：「${targetLang}」。回傳 JSON: {"score": 數字, "feedback": "中文具體建議"}` },
+                                { inlineData: { mimeType: 'audio/webm', data: base64 } }
+                            ]}]
+                        });
+                        const cleanJson = result.candidates[0].content.parts[0].text.replace(/```json|```/g, "").trim();
+                        setScoreData(JSON.parse(cleanJson));
+                    } catch (err) { 
+                        setError("評分分析失敗"); 
+                    } finally { 
+                        setEvaluating(false); 
+                    }
+                };
+            };
+
+            return (
+                <div className="min-h-screen pb-20">
+                    <input type="file" className="hidden" ref={fileInputRef} accept="image/*" onChange={e => {
+                        const f = e.target.files[0]; if (!f) return;
+                        setFile(f); setPreviewUrl(URL.createObjectURL(f));
+                    }} />
+
+                    {/* 導航欄 */}
+                    <nav className="bg-white/90 backdrop-blur-md border-b sticky top-0 z-50 h-16 flex items-center px-4 lg:px-10 justify-between shadow-sm">
+                        <div className="flex items-center gap-8">
+                            <div className="flex items-center gap-2">
+                                <div className="bg-indigo-600 p-1.5 rounded-lg shadow-lg shadow-indigo-100"><Icon name="Zap" className="text-white w-4 h-4 fill-current" /></div>
+                                <span className="font-black text-lg tracking-tight">Readable <span className="text-indigo-600">AI</span></span>
+                            </div>
+                            <div className="hidden sm:flex bg-slate-100 p-1 rounded-xl border border-slate-200">
+                                <button onClick={() => setActiveTab('ocr')} className={`px-6 py-1.5 rounded-lg text-xs font-black transition-all ${activeTab === 'ocr' ? 'bg-white shadow-sm text-indigo-600' : 'text-slate-500'}`}>教材導讀</button>
+                                <button onClick={() => setActiveTab('eval')} className={`px-6 py-1.5 rounded-lg text-xs font-black transition-all ${activeTab === 'eval' ? 'bg-white shadow-sm text-indigo-600' : 'text-slate-500'}`}>發音特訓</button>
+                            </div>
+                        </div>
+                        <div className="flex gap-2">
+                            {LANGUAGES.map(l => (
+                                <button key={l.id} onClick={() => setTargetLang(l.id)} className={`w-8 h-8 rounded-lg flex items-center justify-center text-sm border-2 transition-all ${targetLang === l.id ? 'border-indigo-600 bg-indigo-50 shadow-sm' : 'border-transparent bg-slate-50'}`}>
+                                    {l.flag}
+                                </button>
+                            ))}
+                        </div>
+                    </nav>
+
+                    <main className="max-w-5xl mx-auto p-4 lg:p-10">
+                        {activeTab === 'ocr' ? (
+                            <div className="space-y-8 animate-in">
+                                {!ocrResult && !isOcrProcessing ? (
+                                    <div className="space-y-6">
+                                        <div className="bg-white rounded-3xl shadow-xl p-6 lg:p-8 border border-slate-100">
+                                            <h2 className="text-sm font-black text-slate-400 mb-4 uppercase tracking-widest">文字素材輸入</h2>
+                                            <textarea 
+                                                value={manualText} onChange={e => setManualText(e.target.value)}
+                                                className="w-full h-48 p-4 rounded-2xl bg-slate-50 border-2 border-transparent focus:border-indigo-100 focus:bg-white outline-none transition-all font-bold text-lg"
+                                                placeholder="在此貼上任何文字內容..."
+                                            />
+                                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-6">
+                                                <button onClick={() => handleProcess('manual')} disabled={!manualText.trim()} className="bg-slate-900 text-white py-4 rounded-2xl font-black text-sm hover:bg-indigo-600 disabled:opacity-30 transition-all">
+                                                    開始導讀
+                                                </button>
+                                                <button onClick={() => fileInputRef.current.click()} className="bg-indigo-50 text-indigo-600 py-4 rounded-2xl font-black text-sm flex items-center justify-center gap-2 border-2 border-indigo-100 hover:bg-white transition-all">
+                                                    <Icon name="FileImage" className="w-4 h-4" /> 上傳截圖
+                                                </button>
+                                            </div>
+                                        </div>
+                                        {previewUrl && (
+                                            <div className="bg-white p-4 rounded-3xl border shadow-sm">
+                                                <div className="flex justify-between items-center mb-4">
+                                                    <span className="text-xs font-black text-slate-400 uppercase">預覽已選擇圖片</span>
+                                                    <button onClick={() => handleProcess('ocr')} className="text-xs bg-indigo-600 text-white px-4 py-2 rounded-lg font-bold">從此圖提取文字</button>
+                                                </div>
+                                                <img src={previewUrl} className="w-full h-auto rounded-xl max-h-64 object-contain bg-slate-50" />
+                                            </div>
+                                        )}
+                                    </div>
+                                ) : (
+                                    <div className="bg-white rounded-[32px] shadow-2xl p-6 lg:p-12 border border-slate-100 min-h-[500px] relative">
+                                        {isOcrProcessing ? (
+                                            <div className="absolute inset-0 flex flex-col items-center justify-center bg-white/90 z-10 space-y-4">
+                                                <Icon name="RefreshCw" className="animate-spin text-indigo-600 w-8 h-8" />
+                                                <span className="font-black text-slate-400 text-sm tracking-widest uppercase">AI 正在提取原文...</span>
+                                            </div>
+                                        ) : (
+                                            <div className="space-y-8">
+                                                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-50 pb-6">
+                                                    <h1 className="text-2xl font-black text-slate-800">{ocrResult.title}</h1>
+                                                    <div className="flex gap-2">
+                                                        <button onClick={() => handleSpeak(ocrResult.p)} className="flex-1 sm:flex-none flex items-center justify-center gap-2 px-6 py-3 bg-indigo-600 text-white rounded-xl font-black text-sm shadow-lg shadow-indigo-100 active:scale-95 transition-all">
+                                                            <Icon name="Play" className="w-4 h-4 fill-current" /> PLAY
+                                                        </button>
+                                                        <button onClick={() => { synthRef.current.cancel(); setIsSpeaking(false); setCurrentParaIndex(-1); }} className="w-12 h-12 flex items-center justify-center bg-rose-50 text-rose-500 rounded-xl hover:bg-rose-500 hover:text-white transition-all">
+                                                            <Icon name="RotateCcw" className="w-4 h-4" />
+                                                        </button>
+                                                        <button onClick={() => setOcrResult(null)} className="w-12 h-12 flex items-center justify-center bg-slate-50 text-slate-400 rounded-xl hover:bg-slate-900 hover:text-white transition-all">
+                                                            <Icon name="Trash2" className="w-4 h-4" />
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                                <div className="space-y-6">
+                                                    {ocrResult.p.split('\n').filter(x => x.trim()).map((p, i) => (
+                                                        <p key={i} className={`text-xl lg:text-2xl font-bold leading-relaxed transition-all p-3 rounded-2xl ${currentParaIndex === i ? 'text-indigo-600 bg-indigo-50 shadow-sm border-l-4 border-indigo-600' : 'text-slate-600 border-l-4 border-transparent'}`}>
+                                                            {p}
+                                                        </p>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+                        ) : (
+                            <div className="max-w-2xl mx-auto space-y-6 animate-in">
+                                <div className="bg-white rounded-[32px] shadow-2xl p-8 lg:p-12 border border-slate-100 text-center space-y-10">
+                                    <div className="space-y-2">
+                                        <span className="text-[10px] font-black text-slate-300 uppercase tracking-[0.3em]">輸入你想練習的詞彙</span>
+                                        <input 
+                                            type="text" value={wordInput} onChange={e => { setWordInput(e.target.value); setScoreData(null); }}
+                                            className="w-full text-center text-4xl lg:text-5xl font-black text-indigo-600 bg-transparent border-b-2 border-slate-100 outline-none focus:border-indigo-600 transition-all pb-4"
+                                            placeholder="單字或短語"
+                                        />
+                                    </div>
+                                    <div className="flex items-center justify-center gap-6">
+                                        <button onClick={() => handleGeminiDemo(wordInput)} disabled={!wordInput.trim() || isGeminiSpeaking} className={`w-14 h-14 rounded-2xl flex items-center justify-center shadow-md transition-all ${isGeminiSpeaking ? 'bg-indigo-600 text-white animate-pulse' : 'bg-indigo-50 text-indigo-600 hover:bg-white'}`}>
+                                            <Icon name="GraduationCap" className="w-6 h-6" />
+                                        </button>
+                                        <button 
+                                            onMouseDown={startRecording} onMouseUp={() => mediaRecorderRef.current?.stop()}
+                                            onTouchStart={startRecording} onTouchEnd={() => mediaRecorderRef.current?.stop()}
+                                            className={`w-24 h-24 rounded-[32px] flex items-center justify-center shadow-2xl transition-all active:scale-90 ${isRecording ? 'bg-rose-500 text-white animate-pulse shadow-rose-200' : 'bg-slate-900 text-white hover:bg-indigo-600'}`}
+                                        >
+                                            <Icon name="Mic" className="w-10 h-10" />
+                                        </button>
+                                        <button onClick={() => userAudioUrl && new Audio(userAudioUrl).play()} disabled={!userAudioUrl} className={`w-14 h-14 rounded-2xl flex items-center justify-center shadow-md transition-all ${userAudioUrl ? 'bg-slate-100 text-slate-600 hover:bg-slate-900 hover:text-white' : 'bg-slate-50 text-slate-200'}`}>
+                                            <Icon name="User" className="w-6 h-6" />
+                                        </button>
+                                    </div>
+                                    <div className="pt-4">
+                                        {evaluating ? (
+                                            <div className="flex flex-col items-center gap-3 animate-pulse">
+                                                <Icon name="RefreshCw" className="animate-spin text-indigo-300 w-6 h-6" />
+                                                <span className="text-[10px] font-black text-slate-300 uppercase">AI 正在深度聽析...</span>
+                                            </div>
+                                        ) : scoreData && (
+                                            <div className="bg-slate-50 p-6 rounded-3xl text-left border border-slate-100 animate-in">
+                                                <div className="flex justify-between items-end mb-4 border-b pb-4">
+                                                    <span className="font-black text-slate-400 text-xs uppercase tracking-tighter">準確度得分</span>
+                                                    <span className="text-4xl font-black text-indigo-600">{scoreData.score}<span className="text-xs text-slate-300 ml-1">/10</span></span>
+                                                </div>
+                                                <p className="font-bold text-slate-600 leading-relaxed italic text-sm">"{scoreData.feedback}"</p>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </main>
+
+                    {error && (
+                        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-slate-900 text-white px-8 py-4 rounded-2xl shadow-2xl flex items-center gap-4 z-[100] border border-slate-800 animate-in">
+                            <Icon name="AlertCircle" className="text-rose-500 w-4 h-4" />
+                            <span className="text-xs font-bold">{error}</span>
+                            <button onClick={() => setError(null)} className="ml-4 opacity-50 hover:opacity-100">×</button>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
